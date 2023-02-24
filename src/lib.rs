@@ -1,3 +1,5 @@
+use std::{thread::sleep, collections::HashMap};
+
 use asr::{Process, watcher::Pair, signature::Signature, Address};
 use spinning_top::{Spinlock, const_spinlock};
 use once_cell::sync::Lazy;
@@ -10,8 +12,20 @@ fn update_pair<T: std::fmt::Display + Copy>(variable_name: &str, new_value: T, p
     pair.current = new_value;
 }
 
+#[derive(PartialEq, Debug)]
+enum PatchType {
+    Unknown,
+    DLC,
+    CDLC,
+    Modding,
+    Release,
+}
+
+#[derive(Default)]
 struct MemoryAddresses {
     timr: Option<Address>, // gives access to main timer values
+    save_data_base: Option<Address>, // base of the pointer path that leads to save data
+    save_data_offsets: HashMap<String, [u64; 2]>,
 }
 
 #[derive(Default)]
@@ -29,13 +43,19 @@ struct MemoryValues {
     real_game_time: Pair<f64>, // running times
     real_act_time: Pair<f64>,
     tp_count: Pair<i32>,
+    // save data values
+    yarn:  Pair<i32>,
+    chapter: Pair<i32>,
+    act: Pair<i32>,
+    checkpoint: Pair<i32>,
 }
 
 struct State {
     started_up: bool,
     main_process: Option<Process>,
     values: Lazy<MemoryValues>,
-    addresses: MemoryAddresses,
+    addresses: Lazy<MemoryAddresses>,
+    patch_type: PatchType,
 }
 
 impl State {
@@ -78,10 +98,85 @@ impl State {
             None => return Err("Could not find TIMR address"),
         }
 
-        /*
-        const SAVE_DATA_AOB_VACU: Signature<21> = Signature::new("48 8B 1D ?? ?? ?? ?? 48 85 DB 74 ?? 48 8B 5B ?? 48 85 DB 74 ??");
-        SAVE_DATA_AOB_VACU.scan_process_range(&self.main_process.as_ref().unwrap(), self.main_process.as_ref().unwrap().get_module_address(MAIN_MODULE).unwrap(), size);
-        */
+        
+        // scan for the save file data base address for the pointer path
+        // it will scan until one signature works (if you see this please tell me how i could make this shorter, my brain was fried while making this loopless)
+        let mut scan_result: Option<Address>;
+        const SAVE_DATA_BASE_AOB_DLC2: Signature<16> = Signature::new("48 8B 05 ?? ?? ?? ?? 48 8B 74 24 ?? 48 83 C4 50");
+        scan_result = SAVE_DATA_BASE_AOB_DLC2.scan_process_range(process, hat_main_add, size);
+
+        if scan_result.is_some() && self.patch_type == PatchType::Unknown {
+            self.patch_type = PatchType::DLC;
+        } else if scan_result.is_none() {
+            const SAVE_DATA_AOB_VACU: Signature<21> = Signature::new("48 8B 1D ?? ?? ?? ?? 48 85 DB 74 ?? 48 8B 5B ?? 48 85 DB 74 ??");
+            scan_result = SAVE_DATA_AOB_VACU.scan_process_range(process, hat_main_add, size);
+        }
+
+        if scan_result.is_some() && self.patch_type == PatchType::Unknown {
+            self.patch_type = PatchType::CDLC;
+        } else if scan_result.is_none() {
+            const SAVE_DATA_AOB_MODDING: Signature<20> = Signature::new("48 8B 05 ?? ?? ?? ?? 48 8B D9 48 85 C0 75 ?? 48 89 7C 24 ??");
+            scan_result = SAVE_DATA_AOB_MODDING.scan_process_range(process, hat_main_add, size);
+        }
+
+        if scan_result.is_some() && self.patch_type == PatchType::Unknown {
+            self.patch_type = PatchType::Modding;
+        } else if scan_result.is_none() {
+            const SAVE_DATA_AOB_RELEASE: Signature<16> = Signature::new("48 8B 05 ?? ?? ?? ?? 48 8B 7C 24 ?? 48 83 C4 40");
+            scan_result = SAVE_DATA_AOB_RELEASE.scan_process_range(process, hat_main_add, size);
+        }
+
+        if scan_result.is_some() && self.patch_type == PatchType::Unknown {
+            self.patch_type = PatchType::Release;
+        } else if scan_result.is_none() {
+            return Err("Could not find Save Data base address with sigscan");
+        }
+
+        if scan_result.is_some() {
+            // read data in sigscan, it's an offset for the address found itself which will lead to the save data base pointer
+            let save_data_offset = process.read::<u32>(Address(scan_result.unwrap().0 + 0x3)).unwrap() as u64;
+            // final address is just an addition of the sigscan and the offset, with a slight nudge to land in the correct place with the save data
+            let final_adress = scan_result.unwrap().0 + save_data_offset + 0x7;
+            self.addresses.save_data_base = Some(Address(final_adress - hat_main_add.0));
+        }
+
+        // offsets for the save data pointer path
+        match self.patch_type {
+            PatchType::Unknown => {
+                // just in case... the save files haven't changed in a while anyway so this is the same as CDLC
+                self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x68, 0xF0]);
+                self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x68, 0x108]);
+                self.addresses.save_data_offsets.insert("act".to_owned(), [0x68, 0x10C]);
+                self.addresses.save_data_offsets.insert("checkpoint".to_owned(), [0x68, 0x110]);
+            },
+            PatchType::DLC => {
+                self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x68, 0xF0]);
+                self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x68, 0x108]);
+                self.addresses.save_data_offsets.insert("act".to_owned(), [0x68, 0x10C]);
+                self.addresses.save_data_offsets.insert("checkpoint".to_owned(), [0x68, 0x110]);
+            },
+            PatchType::CDLC => {
+                self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x68, 0xF0]);
+                self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x68, 0x108]);
+                self.addresses.save_data_offsets.insert("act".to_owned(), [0x68, 0x10C]);
+                self.addresses.save_data_offsets.insert("checkpoint".to_owned(), [0x68, 0x110]);
+            },
+            PatchType::Modding => {
+                self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x64, 0xE0]);
+                self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x64, 0xF8]);
+                self.addresses.save_data_offsets.insert("act".to_owned(), [0x64, 0xFC]);
+                self.addresses.save_data_offsets.insert("checkpoint".to_owned(), [0x64, 0x100]);
+            },
+            PatchType::Release => {
+                self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x64, 0xE0]);
+                self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x64, 0xF4]);
+                self.addresses.save_data_offsets.insert("act".to_owned(), [0x64, 0xF8]);
+                self.addresses.save_data_offsets.insert("checkpoint".to_owned(), [0x64, 0xFC]);
+            },
+        }
+
+        asr::timer::set_variable("Patch Type", &format!("{:?}", self.patch_type));
+        
 
         asr::set_tick_rate(120.0);
         
@@ -103,6 +198,7 @@ impl State {
 
         // memory reads
 
+        // TIMR
         // timer state
         if let Ok(value) = process.read_pointer_path64::<i32>(main_module_addr.0, &[self.addresses.timr.unwrap().0 + 0x4]) {
             update_pair("Timer State", value, &mut self.values.timer_state);
@@ -164,6 +260,31 @@ impl State {
             update_pair("Time Pieces", value, &mut self.values.tp_count);
         };
 
+        // save data
+        // yarn
+        let offsets = self.addresses.save_data_offsets["yarn"];
+        if let Ok(value) = process.read_pointer_path64::<i32>(main_module_addr.0, &[self.addresses.save_data_base.unwrap().0, offsets[0], offsets[1]]) {
+            update_pair("Yarn", value, &mut self.values.yarn);
+        };
+
+        // chapter
+        let offsets = self.addresses.save_data_offsets["chapter"];
+        if let Ok(value) = process.read_pointer_path64::<i32>(main_module_addr.0, &[self.addresses.save_data_base.unwrap().0, offsets[0], offsets[1]]) {
+            update_pair("Chapter", value, &mut self.values.chapter);
+        };
+
+        // act
+        let offsets = self.addresses.save_data_offsets["act"];
+        if let Ok(value) = process.read_pointer_path64::<i32>(main_module_addr.0, &[self.addresses.save_data_base.unwrap().0, offsets[0], offsets[1]]) {
+            update_pair("Act", value, &mut self.values.act);
+        };
+
+        // checkpoint
+        let offsets = self.addresses.save_data_offsets["checkpoint"];
+        if let Ok(value) = process.read_pointer_path64::<i32>(main_module_addr.0, &[self.addresses.save_data_base.unwrap().0, offsets[0], offsets[1]]) {
+            update_pair("Checkpoint", value, &mut self.values.checkpoint);
+        };
+
         Ok(())
     }
 
@@ -180,6 +301,7 @@ impl State {
                 if let Err(message) = self.init() {
                     asr::print_message(&format!("ERROR: init() didn't finish properly, message: {}", message));
                     self.main_process = None;
+                    sleep(std::time::Duration::from_secs(2));
                     return;
                 }
             }
@@ -191,6 +313,7 @@ impl State {
         if !self.main_process.as_ref().unwrap().is_open() {
             asr::set_tick_rate(10.0);
             self.main_process = None;
+            self.patch_type = PatchType::Unknown;
             return;
         }
 
@@ -208,7 +331,8 @@ static LS_CONTROLLER: Spinlock<State> = const_spinlock(State {
     started_up: false,
     main_process: None,
     values: Lazy::new(Default::default),
-    addresses: MemoryAddresses { timr: None },
+    addresses: Lazy::new(Default::default),
+    patch_type: PatchType::Unknown,
 });
 
 
