@@ -26,6 +26,9 @@ struct MemoryAddresses {
     timr: Option<Address>, // gives access to main timer values
     save_data_base: Option<Address>, // base of the pointer path that leads to save data
     save_data_offsets: HashMap<String, [u64; 2]>,
+    position_x_pointer_path: Vec<u64>,
+    position_y_pointer_path: Vec<u64>,
+    position_z_pointer_path: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -44,10 +47,14 @@ struct MemoryValues {
     real_act_time: Pair<f64>,
     tp_count: Pair<i32>,
     // save data values
-    yarn:  Pair<i32>,
+    yarn: Pair<i32>,
     chapter: Pair<i32>,
     act: Pair<i32>,
     checkpoint: Pair<i32>,
+    // position values
+    x: Pair<f32>,
+    y: Pair<f32>,
+    z: Pair<f32>,
 }
 
 struct State {
@@ -92,14 +99,16 @@ impl State {
             )
         );
 
+        // if TIMR sig is not found then something went really wrong
         let scan_result_address = TIMR_AOB.scan_process_range(process, hat_main_add, size);
         match scan_result_address {
             Some(scan_result) => self.addresses.timr = Some(Address(scan_result.0 - hat_main_add.0)),
             None => return Err("Could not find TIMR address"),
         }
 
-        
+
         // scan for the save file data base address for the pointer path
+        // TODO: if a savefile/hatkid pos sigscan fails just ignore variables related to it instead of attaching the process again to retry
         // it will scan until one signature works (if you see this please tell me how i could make this shorter, my brain was fried while making this loopless)
         let mut scan_result: Option<Address>;
         const SAVE_DATA_BASE_AOB_DLC2: Signature<16> = Signature::new("48 8B 05 ?? ?? ?? ?? 48 8B 74 24 ?? 48 83 C4 50");
@@ -132,6 +141,7 @@ impl State {
             return Err("Could not find Save Data base address with sigscan");
         }
 
+        // calculate save data pointer path base address
         if scan_result.is_some() {
             // read data in sigscan, it's an offset for the address found itself which will lead to the save data base pointer
             let save_data_offset = process.read::<u32>(Address(scan_result.unwrap().0 + 0x3)).unwrap() as u64;
@@ -175,7 +185,45 @@ impl State {
             },
         }
 
+        // determined with the save data sigscan
         asr::timer::set_variable("Patch Type", &format!("{:?}", self.patch_type));
+        
+        // scan for hat kid's position pointer path
+        const HAT_KID_POS_BASE_AOB: Signature<17> = Signature::new("48 8B 05 ?? ?? ?? ?? 81 88 ?? ?? ?? ?? 00 00 80 00");
+        scan_result = HAT_KID_POS_BASE_AOB.scan_process_range(process, hat_main_add, size);
+        
+        // calculate hat kid pos pointer path base address
+        let mut pos_path_base: u64 = 0;
+        match scan_result {
+            Some(address) => {
+                // same explanation as save data scan result
+                let pos_offset = process.read::<u32>(Address(address.0 + 0x3)).unwrap() as u64;
+                pos_path_base = address.0 + pos_offset + 0x7;
+            },
+            None => {
+
+            }
+        }
+
+        // scan for the offset that varies between patches (stopped working in 2022+ patches)
+        const HAT_KID_POS_OFFSET_AOB: Signature<14> = Signature::new("48 8B 81 ?? ?? ?? ?? 4C 8D 80 ?? ?? ?? ??");
+        scan_result = HAT_KID_POS_OFFSET_AOB.scan_process_range(process, hat_main_add, size);
+
+        match scan_result {
+            Some(address) => {
+                // read the pointer data indicating the variable pointer path offset
+                let offset = process.read::<u32>(Address(address.0 + 0x3)).unwrap() as u64;
+                self.addresses.position_x_pointer_path = vec![pos_path_base - hat_main_add.0, 0x6DC, 0x00, 0x68, offset, 0x80];
+                self.addresses.position_y_pointer_path = vec![pos_path_base - hat_main_add.0, 0x6DC, 0x00, 0x68, offset, 0x84];
+                self.addresses.position_z_pointer_path = vec![pos_path_base - hat_main_add.0, 0x6DC, 0x00, 0x68, offset, 0x88];
+            },
+            None => {
+                // if not found use the hardcoded path
+                self.addresses.position_x_pointer_path = vec![pos_path_base - hat_main_add.0, 0x6DC, 0x00, 0x68, 0x144, 0x718, 0x80];
+                self.addresses.position_y_pointer_path = vec![pos_path_base - hat_main_add.0, 0x6DC, 0x00, 0x68, 0x144, 0x718, 0x84];
+                self.addresses.position_z_pointer_path = vec![pos_path_base - hat_main_add.0, 0x6DC, 0x00, 0x68, 0x144, 0x718, 0x88];
+            }
+        }
         
 
         asr::set_tick_rate(120.0);
@@ -283,6 +331,22 @@ impl State {
         let offsets = self.addresses.save_data_offsets["checkpoint"];
         if let Ok(value) = process.read_pointer_path64::<i32>(main_module_addr.0, &[self.addresses.save_data_base.unwrap().0, offsets[0], offsets[1]]) {
             update_pair("Checkpoint", value, &mut self.values.checkpoint);
+        };
+
+        // position reads
+        // x
+        if let Ok(value) = process.read_pointer_path64::<f32>(main_module_addr.0, &self.addresses.position_x_pointer_path) {
+            update_pair("X", value, &mut self.values.x);
+        };
+
+        // y
+        if let Ok(value) = process.read_pointer_path64::<f32>(main_module_addr.0, &self.addresses.position_y_pointer_path) {
+            update_pair("Y", value, &mut self.values.y);
+        };
+
+        // z
+        if let Ok(value) = process.read_pointer_path64::<f32>(main_module_addr.0, &self.addresses.position_z_pointer_path) {
+            update_pair("Z", value, &mut self.values.z);
         };
 
         Ok(())
