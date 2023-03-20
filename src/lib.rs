@@ -1,12 +1,21 @@
-// next: implement asl functions, start, split, reset, settings
+/*  
+TODO: 
+split (simple)
+start
+reset
+asl helper functions, in new file?
+settings
+detailed splits monkas
+*/
 
-use std::{thread::sleep, collections::HashMap};
+use std::collections::HashMap;
 use asr::{Process, watcher::Pair, Address};
 use spinning_top::{Spinlock, const_spinlock};
 use once_cell::sync::Lazy;
 
 mod memory;
 mod settings;
+mod splits;
 
 const MAIN_MODULE: &str = "HatinTimeGame.exe";
 
@@ -44,10 +53,10 @@ struct MemoryValues {
     act_timer_is_paused: Pair<i32>,
     act_timer_is_visible: Pair<i32>,
     unpause_timer_is_dirty: Pair<i32>, // idk
-    just_got_time_piece: Pair<i32>, // green act timer -> 1
-    game_time: Pair<f64>, // load screen times
+    just_got_time_piece: Pair<i32>, // green act timer -> 1, otherwise 0
+    game_time: Pair<f64>, // igt in loading screen
     act_time: Pair<f64>,
-    real_game_time: Pair<f64>, // running times
+    real_game_time: Pair<f64>, // igt in HUD
     real_act_time: Pair<f64>,
     tp_count: Pair<i32>,
     // save data values
@@ -83,13 +92,9 @@ impl State {
     }
 
     fn init(&mut self) -> Result<(), &str> {
-
-        self.hat_sig_scan()?;
-
+        self.hat_sig_scan_start()?;
         asr::set_tick_rate(120.0);
-        
         Ok(())
-
     }
 
     fn update(&mut self) {
@@ -105,7 +110,6 @@ impl State {
                 if let Err(message) = self.init() {
                     asr::print_message(&format!("ERROR: init() didn't finish properly, message: {message}"));
                     self.main_process = None;
-                    sleep(std::time::Duration::from_secs(2));
                     return;
                 }
             }
@@ -125,14 +129,36 @@ impl State {
             return;
         }
 
-        // start
-        // TODO: IL mode
-        if (self.settings["start_new_file"] && self.values.timer_state.current == 1 && self.values.timer_state.old == 0 && self.values.tp_count.current < 1) 
-            || (!self.settings["start_new_file"] && self.values.timer_state.current == 1 && self.values.timer_state.old == 0){
+        // LS controller logic section
+
+        // start when opening a file depending on the fresh file setting, or entering a level in IL mode
+        if self.settings["start"]
+        && (((self.values.tp_count.current < 1 || !self.settings["start_new_file"]) && self.values.timer_state.old == 0 && self.values.timer_state.current == 1)
+        || (self.settings["il_mode"] && self.values.act_timer_is_visible.increased())) {
             asr::timer::start();
         }
 
-        asr::timer::set_game_time(asr::time::Duration::seconds_f64(self.values.real_game_time.current));
+        // reset, always when going to main menu with an orange running main timer (state 1), and when restarting a level/going to the hub in IL mode
+        if self.settings["reset"]
+        && ((self.values.timer_state.current == 0 && self.values.timer_state.old == 1) 
+        || (self.settings["il_mode"] && (self.values.act_timer_is_visible.decreased() || (self.values.real_act_time.decreased() && self.values.real_act_time.current == 0.0)))){
+            asr::timer::reset();
+        }
+
+        // game time set
+        if self.settings["il_mode"] {
+            asr::timer::set_game_time(asr::time::Duration::seconds_f64(self.values.real_act_time.current));
+        } else {
+            asr::timer::set_game_time(asr::time::Duration::seconds_f64(self.values.real_game_time.current));
+        }
+
+        // is "isloading true" necessary in asr?
+
+        // splits
+        if self.should_split() && self.settings["split"] {
+            asr::timer::split();
+        }
+        
 
     }
 

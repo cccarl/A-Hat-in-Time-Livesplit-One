@@ -4,7 +4,7 @@ use crate::{MAIN_MODULE, PatchType, State, update_pair};
 
 impl State {
 
-    pub fn hat_sig_scan(&mut self) -> Result<(), &str> {
+    pub fn hat_sig_scan_start(&mut self) -> Result<(), &str> {
 
         // idk just some random ass number, TODO: do it like og ls when possible, it iterates through the memory pages
         let size = 0x3200000;
