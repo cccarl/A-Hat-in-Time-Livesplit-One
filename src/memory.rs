@@ -85,20 +85,7 @@ impl State {
     
         // offsets for the save data pointer path
         match self.patch_type {
-            PatchType::Unknown => {
-                // just in case... the save files haven't changed in a while anyway so this is the same as CDLC
-                self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x68, 0xF0]);
-                self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x68, 0x108]);
-                self.addresses.save_data_offsets.insert("act".to_owned(), [0x68, 0x10C]);
-                self.addresses.save_data_offsets.insert("checkpoint".to_owned(), [0x68, 0x110]);
-            },
-            PatchType::Dlc => {
-                self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x68, 0xF0]);
-                self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x68, 0x108]);
-                self.addresses.save_data_offsets.insert("act".to_owned(), [0x68, 0x10C]);
-                self.addresses.save_data_offsets.insert("checkpoint".to_owned(), [0x68, 0x110]);
-            },
-            PatchType::Cdlc => {
+            PatchType::Unknown | PatchType::Dlc | PatchType::Cdlc => {
                 self.addresses.save_data_offsets.insert("yarn".to_owned(), [0x68, 0xF0]);
                 self.addresses.save_data_offsets.insert("chapter".to_owned(), [0x68, 0x108]);
                 self.addresses.save_data_offsets.insert("act".to_owned(), [0x68, 0x10C]);

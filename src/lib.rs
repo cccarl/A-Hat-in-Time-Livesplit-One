@@ -7,15 +7,17 @@ asl helper functions, in new file?
 settings
 detailed splits monkas
 */
+mod memory;
+mod settings;
+mod splits;
 
+use settings::Settings;
 use std::collections::HashMap;
 use asr::{Process, watcher::Pair, Address};
 use spinning_top::{Spinlock, const_spinlock};
 use once_cell::sync::Lazy;
 
-mod memory;
-mod settings;
-mod splits;
+
 
 const MAIN_MODULE: &str = "HatinTimeGame.exe";
 
@@ -72,7 +74,7 @@ struct MemoryValues {
 
 struct State {
     started_up: bool,
-    settings: Lazy<HashMap<String, bool>>,
+    settings: Option<Settings>,
     main_process: Option<Process>,
     values: Lazy<MemoryValues>,
     addresses: Lazy<MemoryAddresses>,
@@ -83,10 +85,7 @@ impl State {
 
     fn startup(&mut self) {
 
-        for setting in settings::get_settings() {
-            self.settings.insert(setting.key.to_string(), asr::user_settings::add_bool(setting.key, setting.description, setting.default_value));
-        }
-
+        self.settings = Some(settings::Settings::register());
         asr::set_tick_rate(10.0);
         self.started_up = true;
     }
@@ -129,33 +128,35 @@ impl State {
             return;
         }
 
+        // unwrap settings
+        let Some(settings) = &self.settings else { return };
+
         // LS controller logic section
 
         // start when opening a file depending on the fresh file setting, or entering a level in IL mode
-        if self.settings["start"]
-        && (((self.values.tp_count.current < 1 || !self.settings["start_new_file"]) && self.values.timer_state.old == 0 && self.values.timer_state.current == 1)
-        || (self.settings["il_mode"] && self.values.act_timer_is_visible.increased())) {
+        if settings.start
+        && (((self.values.tp_count.current < 1 || !settings.start_new_file) && self.values.timer_state.old == 0 && self.values.timer_state.current == 1)
+        || (settings.il_mode && self.values.act_timer_is_visible.increased())) {
             asr::timer::start();
         }
 
         // reset, always when going to main menu with an orange running main timer (state 1), and when restarting a level/going to the hub in IL mode
-        if self.settings["reset"]
+        if settings.reset
         && ((self.values.timer_state.current == 0 && self.values.timer_state.old == 1) 
-        || (self.settings["il_mode"] && (self.values.act_timer_is_visible.decreased() || (self.values.real_act_time.decreased() && self.values.real_act_time.current == 0.0)))){
+        || (settings.il_mode && (self.values.act_timer_is_visible.decreased() || (self.values.real_act_time.decreased() && self.values.real_act_time.current == 0.0)))){
             asr::timer::reset();
         }
 
         // game time set
-        if self.settings["il_mode"] {
+        asr::timer::pause_game_time();
+        if settings.il_mode {
             asr::timer::set_game_time(asr::time::Duration::seconds_f64(self.values.real_act_time.current));
         } else {
             asr::timer::set_game_time(asr::time::Duration::seconds_f64(self.values.real_game_time.current));
         }
 
-        // is "isloading true" necessary in asr?
-
         // splits
-        if self.should_split() && self.settings["split"] {
+        if self.should_split() && settings.split {
             asr::timer::split();
         }
         
@@ -166,7 +167,7 @@ impl State {
 
 static LS_CONTROLLER: Spinlock<State> = const_spinlock(State {
     started_up: false,
-    settings: Lazy::new(HashMap::new),
+    settings: None,
     main_process: None,
     values: Lazy::new(Default::default),
     addresses: Lazy::new(Default::default),
